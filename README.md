@@ -1,4 +1,4 @@
-# rust-srec: 
+# rust-srec:
 
 WIP. Monorepo for a Rust implementation of stream-rec.
 
@@ -12,7 +12,7 @@ The project provides two main command-line applications: `strev-cli` and `mesio-
 
 Please read the [README](https://github.com/hua0512/rust-srec/blob/main/strev-cli/README.md)
 
-### `mesio-cli` 
+### `mesio-cli`
 
 Please read the [README](https://github.com/hua0512/rust-srec/blob/main/mesio-cli/README.md)
 
