@@ -324,10 +324,8 @@ impl Processor<FlvData> for LimitOperator {
                     self.split_stream(output)?;
 
                     // Emit current tag after the split
-                    if !has_video || tag.is_key_frame_nalu() || !self.config.split_at_keyframes_only
-                    {
-                        output(FlvData::Tag(tag))?;
-                    }
+                    // Note: can_split_on_tag guarantees this is a valid tag to emit at this split point
+                    output(FlvData::Tag(tag))?;
                 } else if should_split
                     && self.config.split_at_keyframes_only
                     && self.config.use_retrospective_splitting
@@ -1007,6 +1005,108 @@ mod tests {
 
         assert!(header_count > 1, "Should have more than the initial header");
     }
+    #[test]
+    fn test_duration_limit_no_frames_dropped() {
+        let context = StreamerContext::arc_new();
+
+        // Configure with a duration limit of 500ms and keyframe splitting
+        let config = LimitConfig {
+            max_size_bytes: None,
+            max_duration_ms: Some(500),
+            split_at_keyframes_only: true,
+            use_retrospective_splitting: false,
+            on_split: None,
+        };
+
+        let mut operator = LimitOperator::with_config(context, config);
+        let mut output_items = Vec::new();
+
+        let mut output_fn = |item: FlvData| -> Result<(), PipelineError> {
+            output_items.push(item);
+            Ok(())
+        };
+
+        // Process a header
+        operator
+            .process(test_utils::create_test_header(), &mut output_fn)
+            .unwrap();
+
+        // Send tags: keyframe at 0ms, non-keyframes, then keyframe at 600ms
+        // Duration limit is 500ms, so split should happen at 600ms keyframe
+        operator
+            .process(test_utils::create_video_tag(0, true), &mut output_fn)
+            .unwrap(); // keyframe at 0ms
+        operator
+            .process(test_utils::create_video_tag(100, false), &mut output_fn)
+            .unwrap(); // P-frame at 100ms
+        operator
+            .process(test_utils::create_video_tag(200, false), &mut output_fn)
+            .unwrap(); // P-frame at 200ms
+        operator
+            .process(test_utils::create_video_tag(300, false), &mut output_fn)
+            .unwrap(); // P-frame at 300ms
+        operator
+            .process(test_utils::create_video_tag(400, false), &mut output_fn)
+            .unwrap(); // P-frame at 400ms
+        operator
+            .process(test_utils::create_video_tag(500, false), &mut output_fn)
+            .unwrap(); // P-frame at 500ms
+        // At this point, duration is 500ms, which equals the limit
+        // When the next keyframe comes at 600ms, it should trigger split
+        operator
+            .process(test_utils::create_video_tag(600, true), &mut output_fn)
+            .unwrap(); // keyframe - SHOULD SPLIT HERE
+        operator
+            .process(test_utils::create_video_tag(700, false), &mut output_fn)
+            .unwrap(); // P-frame at 700ms
+
+        operator.finish(&mut output_fn).unwrap();
+
+        // Extract all frame timestamps
+        let timestamps = test_utils::extract_timestamps(&output_items);
+
+        // Check that ALL frames are present, including the keyframe at 600ms
+        assert!(
+            timestamps.contains(&0),
+            "Frame at 0ms should be present"
+        );
+        assert!(
+            timestamps.contains(&100),
+            "Frame at 100ms should be present"
+        );
+        assert!(
+            timestamps.contains(&200),
+            "Frame at 200ms should be present"
+        );
+        assert!(
+            timestamps.contains(&300),
+            "Frame at 300ms should be present"
+        );
+        assert!(
+            timestamps.contains(&400),
+            "Frame at 400ms should be present"
+        );
+        assert!(
+            timestamps.contains(&500),
+            "Frame at 500ms should be present"
+        );
+        assert!(
+            timestamps.contains(&600),
+            "Frame at 600ms (split keyframe) should be present"
+        );
+        assert!(
+            timestamps.contains(&700),
+            "Frame at 700ms should be present"
+        );
+
+        // Count total frames (excluding headers/metadata)
+        let frame_count = timestamps.len();
+        assert_eq!(
+            frame_count, 8,
+            "Expected 8 frames, but got {frame_count}"
+        );
+    }
+
     #[test]
     fn test_audio_only_size_limit_split() {
         let context = StreamerContext::arc_new();
