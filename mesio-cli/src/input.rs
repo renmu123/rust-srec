@@ -4,9 +4,8 @@ use crossterm::{
 };
 use is_terminal::IsTerminal;
 use pipeline_common::CancellationToken;
-use std::io;
+use std::io::{self, BufRead};
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
 use tracing::info;
 
 /// Asynchronously listens for user input to trigger cancellation.
