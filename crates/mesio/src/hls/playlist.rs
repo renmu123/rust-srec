@@ -1,7 +1,6 @@
 // HLS Playlist Engine: Handles fetching, parsing, and managing HLS playlists.
 
-use crate::CacheManager;
-use crate::cache::{CacheKey, CacheMetadata, CacheResourceType};
+use crate::cache::{CacheKey, CacheManager, CacheMetadata, CacheResourceType};
 use crate::hls::HlsDownloaderError;
 use crate::hls::config::{HlsConfig, HlsVariantSelectionPolicy};
 use crate::hls::scheduler::ScheduledSegmentJob;
@@ -14,7 +13,8 @@ use reqwest::Client;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 use url::Url;
 
@@ -33,7 +33,7 @@ pub trait PlaylistProvider: Send + Sync {
         initial_playlist: MediaPlaylist,
         base_url: String,
         segment_request_tx: mpsc::Sender<ScheduledSegmentJob>,
-        mut shutdown_rx: broadcast::Receiver<()>,
+        token: CancellationToken,
     ) -> Result<(), HlsDownloaderError>;
 }
 
@@ -77,9 +77,9 @@ impl PlaylistProvider for PlaylistEngine {
         let cache_key = CacheKey::new(CacheResourceType::Playlist, playlist_url.as_str(), None);
 
         if let Some(cache_service) = &self.cache_service
-            && let Some(cached_data) = cache_service.get(&cache_key).await?
+            && let Ok(Some((cached_data, _, _))) = cache_service.get(&cache_key).await
         {
-            let mut playlist_content = String::from_utf8(cached_data.0.to_vec()).map_err(|e| {
+            let mut playlist_content = String::from_utf8(cached_data.to_vec()).map_err(|e| {
                 HlsDownloaderError::PlaylistError(format!(
                     "Failed to parse cached playlist from UTF-8: {e}"
                 ))
@@ -303,7 +303,7 @@ impl PlaylistProvider for PlaylistEngine {
         mut current_playlist: MediaPlaylist,
         base_url: String,
         segment_request_tx: mpsc::Sender<ScheduledSegmentJob>,
-        mut shutdown_rx: broadcast::Receiver<()>,
+        token: CancellationToken,
     ) -> Result<(), HlsDownloaderError> {
         let playlist_url = Url::parse(playlist_url_str).map_err(|e| {
             HlsDownloaderError::PlaylistError(format!(
@@ -377,8 +377,8 @@ impl PlaylistProvider for PlaylistEngine {
 
             tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received during monitoring for {}.", playlist_url_str);
+                _ = token.cancelled() => {
+                    info!("Cancellation token received during monitoring for {}.", playlist_url_str);
                     return Ok(());
                 }
                 _ = tokio::time::sleep(refresh_delay) => {
@@ -518,7 +518,7 @@ impl PlaylistEngine {
         };
 
         for (idx, processed_segment) in processed_segments.into_iter().enumerate() {
-            let segment = processed_segment.segment;
+            let segment = &processed_segment.segment;
             if let Some(map_info) = &segment.map {
                 let absolute_map_uri = Url::parse(base_url)
                     .and_then(|b| b.join(&map_info.uri))

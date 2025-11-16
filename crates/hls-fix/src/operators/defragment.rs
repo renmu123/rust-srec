@@ -376,16 +376,25 @@ impl DefragmentOperator {
 impl Processor<HlsData> for DefragmentOperator {
     fn process(
         &mut self,
+        context: &Arc<StreamerContext>,
         input: HlsData,
         output: &mut dyn FnMut(HlsData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
+        if context.token.is_cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
         self.process_internal(input, output)
     }
 
     fn finish(
         &mut self,
+        context: &Arc<StreamerContext>,
         output: &mut dyn FnMut(HlsData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
+        if context.token.is_cancelled() {
+            debug!("Cancellation requested during finish, attempting to flush buffer.");
+        }
+
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -407,7 +416,15 @@ impl Processor<HlsData> for DefragmentOperator {
         // Enhanced segment validation before flushing
         let is_valid_segment = match self.segment_type {
             Some(SegmentType::Ts) => {
-                self.buffer.len() >= min_required && self.validate_ts_segment_completeness()
+                // For TS segments in gathering mode, we've already validated the stream
+                // and established it's valid, so we can be more lenient with the final flush
+                if self.is_gathering {
+                    // Still validate completeness, but allow smaller buffers if we have PSI tables
+                    self.validate_ts_segment_completeness()
+                } else {
+                    // Not yet gathering, need full validation
+                    self.buffer.len() >= min_required && self.validate_ts_segment_completeness()
+                }
             }
             Some(SegmentType::M4sInit) | Some(SegmentType::M4sMedia) => {
                 self.buffer.len() >= min_required
@@ -419,6 +436,13 @@ impl Processor<HlsData> for DefragmentOperator {
             let count = self.buffer.len();
 
             for item in self.buffer.drain(..) {
+                if context.token.is_cancelled() {
+                    warn!(
+                        "{} Cancellation occurred during flush, some data might be lost.",
+                        self.context.name
+                    );
+                    return Err(PipelineError::Cancelled);
+                }
                 output(item)?;
             }
             self.reset();

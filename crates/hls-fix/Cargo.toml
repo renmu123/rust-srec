@@ -1,21 +1,23 @@
 [package]
 name = "hls-fix"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2024"
 description = "HLS processing toolkit"
 
 [dependencies]
-bytes = "1.10.1"
+bytes = "1.11.0"
 m3u8-rs = "6.0.0"
 hls = { path = "../hls" }
 pipeline-common = { path = "../pipeline-common" }
 crc32fast = "1.4.2"
 tracing = "0.1"
-thiserror = "2.0.16"
+tracing-indicatif = "0.3"
+thiserror = "2.0.17"
 
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+tokio-util = { version = "0.7.17" }
 
 
 [lints.rust]

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use clap::Parser;
 use config::ProgramConfig;
@@ -7,23 +7,24 @@ use flv_fix::FlvPipelineConfig;
 use flv_fix::RepairStrategy;
 use flv_fix::ScriptFillerConfig;
 use hls_fix::HlsPipelineConfig;
-use indicatif::MultiProgress;
 use mesio_engine::flv::FlvProtocolConfig;
 use mesio_engine::{DownloaderConfig, HlsProtocolBuilder, ProxyAuth, ProxyConfig, ProxyType};
-use pipeline_common::config::PipelineConfig;
+use pipeline_common::{CancellationToken, config::PipelineConfig};
 use tracing::{Level, error, info};
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod cli;
 mod config;
 mod error;
+mod input;
 mod output;
 mod processor;
 mod utils;
 
 use cli::CliArgs;
-use tracing_subscriber::FmtSubscriber;
-use tracing_subscriber::fmt::writer::MakeWriterExt;
-use utils::progress::ProgressManager;
+use input::input_handler;
 use utils::{parse_headers, parse_params, parse_size, parse_time};
 
 fn main() {
@@ -40,27 +41,65 @@ async fn bootstrap() -> Result<(), AppError> {
     // Parse command-line arguments
     let args = CliArgs::parse();
 
-    // Setup logging
+    // Create a cancellation token
+    let token = CancellationToken::new();
+
+    // Spawn the input handler
+    tokio::spawn(input_handler(token.clone()));
+
+    // Setup logging with tracing-indicatif
     let log_level = if args.verbose {
         Level::DEBUG
     } else {
         Level::INFO
     };
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("mesio.log")?;
 
-    let multi_writer = MakeWriterExt::and(std::io::stdout, log_file);
+    // Create file appender for mesio.log
+    let file_appender = tracing_appender::rolling::daily(".", "mesio.log");
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
-        .with_writer(multi_writer)
-        .with_ansi(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| AppError::Initialization(e.to_string()))?;
+    // Create file logging layer
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_file)
+        .with_ansi(false);
+
+    let filter = tracing_subscriber::filter::LevelFilter::from_level(log_level);
+
+    // Conditionally setup progress bars based on --progress flag
+    if args.show_progress {
+        // Create IndicatifLayer for progress bars and console output
+        let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(8, None);
+
+        // Create console logging layer that writes through indicatif
+        // Use compact format to reduce verbosity
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_writer(indicatif_layer.get_stderr_writer())
+            .with_ansi(true)
+            .without_time()
+            .with_target(true)
+            .compact(); // Use compact format without full span paths
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(console_layer)
+            .with(indicatif_layer)
+            .init();
+    } else {
+        // Simple console output without progress bars
+        // Use compact format to reduce verbosity
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(true)
+            .without_time()
+            .with_target(true)
+            .compact(); // Use compact format without full span paths
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(console_layer)
+            .init();
+    }
 
     info!("███╗   ███╗███████╗███████╗██╗ ██████╗ ");
     info!("████╗ ████║██╔════╝██╔════╝██║██╔═══██╗");
@@ -120,16 +159,8 @@ async fn bootstrap() -> Result<(), AppError> {
     // Determine output directory
     let output_dir = args.output_dir.unwrap_or_else(|| PathBuf::from("./fix"));
 
-    // Create a progress manager based on show_progress flag
-    let multi = MultiProgress::new();
-    let progress_manager = if args.show_progress {
-        ProgressManager::new(multi.clone())
-    } else {
-        ProgressManager::new_disabled(multi.clone())
-    };
-
     // Handle proxy configuration
-    let (proxy_config, _use_system_proxy) = if args.no_proxy {
+    let (proxy_config, use_system_proxy) = if args.no_proxy {
         // No proxy flag overrides everything else
         info!("All proxy settings disabled (--no-proxy flag)");
         (None, false)
@@ -189,7 +220,7 @@ async fn bootstrap() -> Result<(), AppError> {
         if let Some(proxy) = proxy_config {
             builder = builder.with_proxy(proxy);
         } else {
-            builder = builder.with_system_proxy(args.use_system_proxy);
+            builder = builder.with_system_proxy(use_system_proxy);
         }
         builder.build()
     };
@@ -227,15 +258,27 @@ async fn bootstrap() -> Result<(), AppError> {
         .map_err(|err| AppError::InvalidInput(err.to_string()))?;
 
     // Process input files
-    processor::process_inputs(
+    let result = processor::process_inputs(
         &args.input,
         &output_dir,
         &program_config,
         &args.output_name_template,
-        Some(Arc::new(move |event| {
-            progress_manager.handle_event(event);
-        })),
+        &token,
     )
-    .await?;
-    Ok(())
+    .await;
+
+    // Ensure the token is always cancelled to terminate the input_handler.
+    let final_result = if token.is_cancelled() {
+        info!("Operation cancelled by user. Exiting gracefully.");
+        Ok(())
+    } else {
+        result
+    };
+
+    token.cancel();
+
+    // Give a moment for any background spans to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    final_result
 }

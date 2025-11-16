@@ -13,6 +13,7 @@ use crate::extractor::platforms::douyin::utils::{
     GlobalTtwidManager, extract_rid, fetch_ttwid, generate_ms_token, generate_nonce,
     generate_odin_ttid, get_common_params,
 };
+use crate::extractor::utils::parse_bool_from_extras;
 use crate::media::formats::{MediaFormat, StreamFormat};
 use crate::media::media_info::MediaInfo;
 use crate::media::stream_info::StreamInfo;
@@ -84,10 +85,8 @@ impl Douyin {
         //     extractor.add_param(key.to_string(), value.to_string());
         // }
 
-        let force_origin_quality = extras
-            .as_ref()
-            .and_then(|extras| extras.get("force_origin_quality").and_then(|v| v.as_bool()))
-            .unwrap_or(true);
+        let force_origin_quality =
+            parse_bool_from_extras(extras.as_ref(), "force_origin_quality", false);
 
         let ttwid_management_mode_str = extras
             .as_ref()
@@ -485,6 +484,8 @@ impl<'a> DouyinRequest<'a> {
             .as_ref()
             .ok_or_else(|| ExtractorError::ValidationError("Stream is not live".to_string()))?;
         let streams = self.extract_streams(stream_url)?;
+        let mut extras = self.config.extractor.get_platform_headers_map();
+        extras.insert("id_str".to_string(), self.id_str.clone().unwrap());
 
         Ok(MediaInfo::new(
             self.config.extractor.url.clone(),
@@ -494,7 +495,7 @@ impl<'a> DouyinRequest<'a> {
             avatar_url,
             is_live,
             streams,
-            Some(self.config.extractor.get_platform_headers_map()),
+            Some(extras),
         ))
     }
 
@@ -775,7 +776,7 @@ mod tests {
     use crate::extractor::platforms::douyin::models::{DouyinAvatarThumb, DouyinUserInfo};
     use crate::extractor::platforms::douyin::utils::GlobalTtwidManager;
 
-    const TEST_URL: &str = "https://live.douyin.com/Shenxin543";
+    const TEST_URL: &str = "https://live.douyin.com/399712108028";
 
     #[tokio::test]
     #[ignore]
@@ -795,7 +796,7 @@ mod tests {
         let config = Douyin::new(TEST_URL.to_string(), default_client(), None, None);
 
         assert_eq!(config.extractor.url, TEST_URL);
-        assert!(config.force_origin_quality);
+        assert!(!config.force_origin_quality);
         assert_eq!(config.ttwid_management_mode, TtwidManagementMode::Global);
         assert!(config.ttwid.is_none());
     }
@@ -875,7 +876,7 @@ mod tests {
         let banned_user = DouyinUserInfo {
             id_str: "1",
             sec_uid: "1",
-            nickname: "账号已注销",
+            nickname: "账号已注销".to_string(),
             avatar_thumb: DouyinAvatarThumb {
                 url_list: vec!["http://example.com/aweme_default_avatar.png".into()],
             },
@@ -885,7 +886,7 @@ mod tests {
         let active_user = DouyinUserInfo {
             id_str: "2",
             sec_uid: "2",
-            nickname: "ActiveUser",
+            nickname: "ActiveUser".to_string(),
             avatar_thumb: DouyinAvatarThumb {
                 url_list: vec!["http://example.com/real_avatar.png".into()],
             },

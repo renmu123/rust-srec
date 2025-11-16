@@ -1,20 +1,23 @@
 [package]
 name = "mesio"
-version = "0.3.0"
+version = "0.3.4"
 edition = "2024"
 description = "Mesio (media) streaming downloader CLI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hua0512/rust-srec"
 
 [dependencies]
-bytes = "1.10.1"
-tokio = { version = "1.47.1", default-features = false, features = ["rt-multi-thread", "macros", "io-util"] }
+bytes = "1.11.0"
+tokio = { version = "1.48.0", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "sync"] }
+tokio-util = { version = "0.7.11" }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "stream",
     "rustls-tls",
 ] }
+crossterm = "0.29.0"
+is-terminal = "0.4"
 
 # CLI dependencies
 clap = { version = "4.5", features = ["derive"] }
@@ -22,6 +25,8 @@ clap = { version = "4.5", features = ["derive"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi"] }
+tracing-appender = "0.2.3"
+tracing-indicatif = "0.3"
 
 # Workspace crates
 pipeline-common = { path = "../crates/pipeline-common" }
@@ -30,10 +35,6 @@ flv-fix = { path = "../crates/flv-fix" }
 hls = { path = "../crates/hls" }
 hls-fix = { path = "../crates/hls-fix" }
 mesio-engine = { path = "../crates/mesio", features = ["clap"] }
-indicatif = "0.18.0"
+indicatif = "0.18.2"
 thiserror = "2.0"
 
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true

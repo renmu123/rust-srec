@@ -11,9 +11,10 @@ use crate::hls::processor::{SegmentProcessor, SegmentTransformer};
 use crate::hls::scheduler::{ScheduledSegmentJob, SegmentScheduler};
 use reqwest::Client;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, debug, error};
 
 use super::HlsDownloaderError;
 
@@ -30,15 +31,18 @@ pub struct HlsStreamCoordinator;
 impl HlsStreamCoordinator {
     /// Sets up all components, spawns their tasks, and returns the client event receiver,
     /// a shutdown sender, and handles to the spawned tasks.
+    ///
+    /// Optional parent_span can be provided for progress bar hierarchy.
     pub async fn setup_and_spawn(
         initial_url: String,
         config: Arc<HlsConfig>,
         http_client: Client,
         cache_manager: Option<Arc<CacheManager>>,
+        token: CancellationToken,
+        parent_span: Option<tracing::Span>,
     ) -> Result<
         (
             mpsc::Receiver<Result<HlsStreamEvent, HlsDownloaderError>>, // client_event_rx
-            broadcast::Sender<()>,                                      // shutdown_tx
             AllTaskHandles,
         ),
         HlsDownloaderError,
@@ -73,9 +77,9 @@ impl HlsStreamCoordinator {
         let (segment_request_tx, segment_request_rx) =
             mpsc::channel::<ScheduledSegmentJob>(config.scheduler_config.download_concurrency + 5);
 
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-        let shutdown_rx_for_playlist_engine = shutdown_tx.subscribe();
-        let shutdown_rx_for_scheduler = shutdown_tx.subscribe();
+        let token_for_playlist_engine = token.clone();
+        let token_for_scheduler = token.clone();
+        let token_for_output_manager = token;
 
         // initial playlist
         let initial_playlist_data = playlist_engine.load_initial_playlist(&initial_url).await?;
@@ -114,7 +118,7 @@ impl HlsStreamCoordinator {
             client_event_tx.clone(),
             is_live,
             initial_media_playlist.media_sequence,
-            shutdown_rx,
+            token_for_output_manager,
         );
 
         let mut segment_scheduler = SegmentScheduler::new(
@@ -123,49 +127,32 @@ impl HlsStreamCoordinator {
             segment_processor,
             segment_request_rx,
             processed_segments_tx,
-            shutdown_rx_for_scheduler,
+            token_for_scheduler,
         );
 
-        let mut shutdown_tx_for_playlist_engine = shutdown_tx.subscribe();
-
         let output_manager_handle = tokio::spawn(async move {
-            #[allow(clippy::never_loop)]
-            loop {
-                debug!(
-                    "OutputManager task (Coordinator): Top of select loop. is_live: {}",
-                    is_live
-                );
-                tokio::select! {
-                    biased;
-                    // External Shutdown Signal
-                    res = shutdown_tx_for_playlist_engine.recv() => {
-                        match res {
-                            Ok(_) => debug!("Received external shutdown signal."),
-                            Err(e) => error!("Error receiving external shutdown signal: {:?}. Treating as shutdown.", e),
-                        }
-                        output_manager.signal_stream_end_and_flush().await;
-                        debug!("signal_stream_end_and_flush() completed.");
-                        break;
-                    }
-                    // OutputManager::run() completes
-                    _ = output_manager.run() => {
-                        debug!("output_manager.run() completed.");
-                        break;
-                    }
-                }
-            }
-            debug!("OutputManager task (Coordinator): Loop exited. Task is now exiting.");
+            output_manager.run().await;
+            debug!("OutputManager task finished.");
         });
 
-        let scheduler_handle = tokio::spawn(async move {
-            segment_scheduler.run().await;
-        });
+        let scheduler_parent_span = parent_span.clone();
+        let scheduler_handle = if let Some(span) = scheduler_parent_span {
+            tokio::spawn(
+                async move {
+                    segment_scheduler.run().await;
+                }
+                .instrument(span),
+            )
+        } else {
+            tokio::spawn(async move {
+                segment_scheduler.run().await;
+            })
+        };
 
         let playlist_engine_handle = {
             let playlist_url = selected_media_playlist_url.unwrap_or(initial_url);
             let playlist_engine_clone = playlist_engine.clone();
             let base_url_clone = base_url.clone();
-            let shutdown_tx_clone = shutdown_tx.clone();
 
             Some(tokio::spawn(async move {
                 let res = playlist_engine_clone
@@ -174,17 +161,17 @@ impl HlsStreamCoordinator {
                         initial_media_playlist,
                         base_url_clone,
                         segment_request_tx,
-                        shutdown_rx_for_playlist_engine,
+                        token_for_playlist_engine,
                     )
                     .await;
 
                 if let Err(e) = &res {
                     error!("Playlist engine monitoring task ended with error: {:?}", e);
-                }
-
-                // Signal shutdown if there are any receivers
-                if shutdown_tx_clone.receiver_count() > 0 {
-                    let _ = shutdown_tx_clone.send(());
+                    // Unlike before, we don't signal other tasks to shut down.
+                    // The CancellationToken is the single source of truth for cancellation.
+                    // If the playlist fails, the scheduler will eventually run out of jobs
+                    // and terminate, which will close the output channel, and the
+                    // output manager will then terminate.
                 }
 
                 res
@@ -197,13 +184,14 @@ impl HlsStreamCoordinator {
             output_manager_handle,
         };
 
-        Ok((client_event_rx, shutdown_tx, handles))
+        Ok((client_event_rx, handles))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_USER_AGENT;
     use crate::hls::config::HlsConfig;
     use crate::{CacheConfig, CacheManager, create_client};
     use std::sync::Arc;
@@ -234,7 +222,7 @@ mod tests {
 
         let config = Arc::new(config);
         let downloader_config = crate::DownloaderConfig::builder()
-            .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+            .with_user_agent(DEFAULT_USER_AGENT)
             .with_timeout(std::time::Duration::from_secs(30))
             .with_header("referer", "http://live.douyin.com")
             .build();
@@ -245,11 +233,18 @@ mod tests {
 
         let cache = Some(cache_manager);
 
-        let result =
-            HlsStreamCoordinator::setup_and_spawn(initial_url, config, client, cache).await;
+        let result = HlsStreamCoordinator::setup_and_spawn(
+            initial_url,
+            config,
+            client,
+            cache,
+            CancellationToken::new(),
+            None, // No parent span for test
+        )
+        .await;
 
         assert!(result.is_ok());
-        let (mut client_event_rx, _shutdown_tx, _handles) = result.unwrap();
+        let (mut client_event_rx, _handles) = result.unwrap();
 
         while let Some(event) = client_event_rx.recv().await {
             match event {

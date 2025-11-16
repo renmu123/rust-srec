@@ -23,6 +23,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use thiserror::Error;
 
+pub mod cancellation;
 pub mod config;
 mod context;
 pub mod pipeline;
@@ -43,6 +44,7 @@ pub use writer_task::{
 };
 
 use crate::config::PipelineConfig;
+pub use cancellation::CancellationToken;
 
 /// Common error type for pipeline operations
 #[derive(Error, Debug)]
@@ -55,6 +57,9 @@ pub enum PipelineError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("Operation was cancelled")]
+    Cancelled,
 }
 
 pub trait ProtocolWriter: Send + 'static {
@@ -62,11 +67,12 @@ pub trait ProtocolWriter: Send + 'static {
     type Stats: Send + 'static;
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Creates a new writer instance.
+    /// Progress tracking is now handled via tracing spans instead of callbacks.
     fn new(
         output_dir: PathBuf,
         base_name: String,
         extension: String,
-        on_progress: Option<std::sync::Arc<dyn Fn(ProgressEvent) + Send + Sync + 'static>>,
         extras: Option<HashMap<String, String>>,
     ) -> Self;
 

@@ -37,6 +37,7 @@ use tracing::{debug, info, trace};
 pub struct GopSortOperator {
     context: Arc<StreamerContext>,
     gop_tags: Vec<FlvTag>,
+    has_video: bool,
 }
 
 impl GopSortOperator {
@@ -47,6 +48,7 @@ impl GopSortOperator {
         Self {
             context,
             gop_tags: Vec::new(),
+            has_video: false,
         }
     }
 
@@ -192,32 +194,33 @@ impl GopSortOperator {
 impl Processor<FlvData> for GopSortOperator {
     fn process(
         &mut self,
+        context: &Arc<StreamerContext>,
         input: FlvData,
         output: &mut dyn FnMut(FlvData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
+        if context.token.is_cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
         match input {
-            FlvData::Header(_) | FlvData::EndOfSequence(_) => {
+            FlvData::Header(header) => {
                 // Process any buffered tags first
                 self.push_tags(output)?;
-
-                // Forward the header or EOS
-                // do not send end of stream to output
-                if input.is_end_of_sequence() {
-                    debug!("{} End of stream...", self.context.name);
-                    return Ok(());
-                }
-
-                output(input)?;
+                self.has_video = header.has_video;
+                output(FlvData::Header(header))?;
                 debug!("{} Reset GOP tags...", self.context.name);
             }
+            FlvData::EndOfSequence(_) => {
+                self.push_tags(output)?;
+                debug!("{} End of stream...", self.context.name);
+            }
             FlvData::Tag(tag) => {
-                // Check for a nalu keyframe
-                if tag.is_key_frame_nalu() {
-                    // On keyframe, process buffered tags
+                // if we have video, we wait for a keyframe
+                if self.has_video && tag.is_key_frame_nalu() {
                     self.push_tags(output)?;
-                    // Start the new buffer with this keyframe
+                } else if !self.has_video && self.gop_tags.len() >= Self::TAGS_BUFFER_SIZE {
+                    // if we don't have video, we flush the buffer when it's full
+                    self.push_tags(output)?;
                 }
-                // Just add non-keyframe to buffer
                 self.gop_tags.push(tag);
             }
         }
@@ -226,9 +229,10 @@ impl Processor<FlvData> for GopSortOperator {
 
     fn finish(
         &mut self,
+        _context: &Arc<StreamerContext>,
         output: &mut dyn FnMut(FlvData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
-        // Process any remaining buffered tags at end of stream
+        // Process any remaining buffered tags at end of stream, even if cancelled
         self.push_tags(output)?;
         info!("{} GOP sort completed", self.context.name);
         Ok(())
@@ -247,12 +251,12 @@ mod tests {
         create_test_header, create_video_sequence_header, create_video_tag,
     };
     use flv::tag::FlvTagType;
-    use pipeline_common::StreamerContext;
+    use pipeline_common::{CancellationToken, StreamerContext};
 
     #[test]
     fn test_sequence_header_special_handling() {
-        let context = StreamerContext::arc_new();
-        let mut operator = GopSortOperator::new(context);
+        let context = StreamerContext::arc_new(CancellationToken::new());
+        let mut operator = GopSortOperator::new(context.clone());
         let mut output_items = Vec::new();
 
         // Create a mutable output function
@@ -263,33 +267,33 @@ mod tests {
 
         // Send header
         operator
-            .process(create_test_header(), &mut output_fn)
+            .process(&context, create_test_header(), &mut output_fn)
             .unwrap();
 
         // Send script tag + sequence headers (in mixed order) + a few regular tags
         operator
-            .process(create_audio_tag(5), &mut output_fn)
+            .process(&context, create_audio_tag(5), &mut output_fn)
             .unwrap();
         operator
-            .process(create_script_tag(0, false), &mut output_fn)
+            .process(&context, create_script_tag(0, false), &mut output_fn)
             .unwrap();
         operator
-            .process(create_video_sequence_header(0, 1), &mut output_fn)
+            .process(&context, create_video_sequence_header(0, 1), &mut output_fn)
             .unwrap();
         operator
-            .process(create_audio_sequence_header(0, 1), &mut output_fn)
+            .process(&context, create_audio_sequence_header(0, 1), &mut output_fn)
             .unwrap();
         operator
-            .process(create_video_tag(20, false), &mut output_fn)
+            .process(&context, create_video_tag(20, false), &mut output_fn)
             .unwrap();
 
         // Send a keyframe to trigger emission
         operator
-            .process(create_video_tag(30, true), &mut output_fn)
+            .process(&context, create_video_tag(30, true), &mut output_fn)
             .unwrap();
 
         // Finish processing
-        operator.finish(&mut output_fn).unwrap();
+        operator.finish(&context, &mut output_fn).unwrap();
 
         test_utils::print_tags(&output_items);
 
@@ -319,8 +323,8 @@ mod tests {
 
     #[test]
     fn test_interleaving() {
-        let context = StreamerContext::arc_new();
-        let mut operator = GopSortOperator::new(context);
+        let context = StreamerContext::arc_new(CancellationToken::new());
+        let mut operator = GopSortOperator::new(context.clone());
         let mut output_items = Vec::new();
 
         // Create a mutable output function
@@ -331,33 +335,33 @@ mod tests {
 
         // Send header
         operator
-            .process(create_test_header(), &mut output_fn)
+            .process(&context, create_test_header(), &mut output_fn)
             .unwrap();
 
         // Send audio and video tags with specific timestamps for testing interleaving
         operator
-            .process(create_audio_tag(10), &mut output_fn)
+            .process(&context, create_audio_tag(10), &mut output_fn)
             .unwrap(); // A10
         operator
-            .process(create_video_tag(20, false), &mut output_fn)
+            .process(&context, create_video_tag(20, false), &mut output_fn)
             .unwrap(); // V20
         operator
-            .process(create_audio_tag(25), &mut output_fn)
+            .process(&context, create_audio_tag(25), &mut output_fn)
             .unwrap(); // A25
         operator
-            .process(create_video_tag(30, false), &mut output_fn)
+            .process(&context, create_video_tag(30, false), &mut output_fn)
             .unwrap(); // V30
         operator
-            .process(create_audio_tag(35), &mut output_fn)
+            .process(&context, create_audio_tag(35), &mut output_fn)
             .unwrap(); // A35
 
         // Send keyframe to trigger emission
         operator
-            .process(create_video_tag(40, true), &mut output_fn)
+            .process(&context, create_video_tag(40, true), &mut output_fn)
             .unwrap(); // V40 (keyframe)
 
         // Finish processing
-        operator.finish(&mut output_fn).unwrap();
+        operator.finish(&context, &mut output_fn).unwrap();
 
         test_utils::print_tags(&output_items);
 
@@ -396,8 +400,8 @@ mod tests {
     #[test]
     fn test_audio_tags_before_first_video() {
         // Setup with audio tags having earlier timestamps than any video tag
-        let context = StreamerContext::arc_new();
-        let mut operator = GopSortOperator::new(context);
+        let context = StreamerContext::arc_new(CancellationToken::new());
+        let mut operator = GopSortOperator::new(context.clone());
         let mut output_items = Vec::new();
 
         // Create a mutable output function
@@ -408,27 +412,27 @@ mod tests {
 
         // Send header
         operator
-            .process(create_test_header(), &mut output_fn)
+            .process(&context, create_test_header(), &mut output_fn)
             .unwrap();
 
         // Send audio tags with timestamps before any video tag
         operator
-            .process(create_audio_tag(5), &mut output_fn)
+            .process(&context, create_audio_tag(5), &mut output_fn)
             .unwrap(); // A5
         operator
-            .process(create_audio_tag(10), &mut output_fn)
+            .process(&context, create_audio_tag(10), &mut output_fn)
             .unwrap(); // A10
 
         // Send video tags with higher timestamps
         operator
-            .process(create_video_tag(20, false), &mut output_fn)
+            .process(&context, create_video_tag(20, false), &mut output_fn)
             .unwrap(); // V20
         operator
-            .process(create_video_tag(30, true), &mut output_fn)
+            .process(&context, create_video_tag(30, true), &mut output_fn)
             .unwrap(); // V30 (keyframe)
 
         // Finish processing
-        operator.finish(&mut output_fn).unwrap();
+        operator.finish(&context, &mut output_fn).unwrap();
 
         test_utils::print_tags(&output_items);
 
@@ -449,5 +453,44 @@ mod tests {
             audio_tags_count, 2,
             "All audio tags should be present in output"
         );
+    }
+    #[test]
+    fn test_audio_only_stream() {
+        let context = StreamerContext::arc_new(CancellationToken::new());
+        let mut operator = GopSortOperator::new(context.clone());
+        let mut output_items = Vec::new();
+
+        let mut output_fn = |item: FlvData| -> Result<(), PipelineError> {
+            output_items.push(item);
+            Ok(())
+        };
+
+        // Create a header with no video
+        let mut header = create_test_header();
+        if let FlvData::Header(ref mut h) = header {
+            h.has_video = false;
+        }
+
+        operator.process(&context, header, &mut output_fn).unwrap();
+
+        // Send more than TAGS_BUFFER_SIZE audio tags
+        for i in 0..15 {
+            operator
+                .process(&context, create_audio_tag(i * 10), &mut output_fn)
+                .unwrap();
+        }
+
+        operator.finish(&context, &mut output_fn).unwrap();
+
+        test_utils::print_tags(&output_items);
+
+        // Check that audio tags were flushed before the end
+        // The header is at index 0, so we check the count of tags after that.
+        // 10 tags should be flushed when the buffer is full, and the remaining 5 on finish.
+        let tag_count = output_items
+            .iter()
+            .filter(|item| matches!(item, FlvData::Tag(_)))
+            .count();
+        assert_eq!(tag_count, 15, "All audio tags should be flushed");
     }
 }

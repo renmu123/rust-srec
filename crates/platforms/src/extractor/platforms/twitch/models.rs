@@ -4,8 +4,15 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwitchResponse {
-    pub data: Data,
+    pub data: Option<Data>,
+    pub errors: Option<Vec<TwitchError>>,
     // pub extensions: Extensions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwitchError {
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,7 +37,8 @@ pub struct UserOrError {
     pub id: String,
     pub login: String,
     pub display_name: String,
-    pub primary_color_hex: String,
+    #[serde(default)]
+    pub primary_color_hex: Option<String>,
     #[serde(rename = "profileImageURL")]
     pub profile_image_url: String,
     pub stream: Option<Stream>,
@@ -44,15 +52,31 @@ pub struct UserOrError {
 #[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: String,
-    pub primary_color_hex: String,
-    pub is_partner: bool,
+    #[serde(default)]
+    pub primary_color_hex: Option<String>,
+    #[serde(default)]
+    pub roles: Option<UserRoles>,
     #[serde(rename = "profileImageURL")]
     pub profile_image_url: String,
+    #[serde(default)]
     pub primary_team: Option<PrimaryTeam>,
     // pub squad_stream: Option<serde_json::Value>,
-    pub channel: Channel,
+    #[serde(default)]
+    pub channel: Option<Channel>,
+    #[serde(default)]
     pub last_broadcast: Option<LastBroadcast>,
+    #[serde(default)]
     pub stream: Option<Stream>,
+    #[serde(rename = "__typename")]
+    pub typename: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRoles {
+    pub is_partner: bool,
+    #[serde(default)]
+    pub is_participating_dj: Option<bool>,
     #[serde(rename = "__typename")]
     pub typename: String,
 }
@@ -62,7 +86,8 @@ pub struct User {
 #[serde(rename_all = "camelCase")]
 pub struct Stream {
     pub id: String,
-    pub viewers_count: u64,
+    #[serde(default)]
+    pub viewers_count: Option<u64>,
     #[serde(rename = "__typename")]
     pub typename: String,
     #[serde(rename = "type")]
@@ -86,10 +111,13 @@ pub struct Channel {
     pub id: String,
     #[serde(rename = "__typename")]
     pub typename: String,
-    #[serde(rename = "self")]
+    #[serde(default, rename = "self")]
     pub self_edge: Option<ChannelSelfEdge>,
     pub trailer: Option<Trailer>,
-    pub chanlets: Option<serde_json::Value>,
+    // #[serde(default)]
+    // pub home: Option<serde_json::Value>,
+    // #[serde(default)]
+    // pub chanlets: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,8 +150,8 @@ pub struct PrimaryTeam {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LastBroadcast {
-    pub id: String,
-    pub title: String,
+    pub id: Option<String>,
+    pub title: Option<String>,
     #[serde(rename = "__typename")]
     pub typename: String,
 }

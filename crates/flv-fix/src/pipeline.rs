@@ -159,7 +159,7 @@ impl PipelineProvider for FlvPipeline {
 
         // Create all operators with adapters
         let defrag_operator = DefragmentOperator::new(context.clone());
-        let header_check_operator = HeaderCheckOperator::new(context.clone());
+        let header_check_operator = HeaderCheckOperator::new(context.clone(), true, true);
 
         // Configure the limit operator
         let limit_config = LimitConfig {
@@ -174,7 +174,6 @@ impl PipelineProvider for FlvPipeline {
                 None
             },
             split_at_keyframes_only: true,
-            use_retrospective_splitting: false,
             on_split: None,
         };
         let limit_operator = LimitOperator::with_config(context.clone(), limit_config);
@@ -288,7 +287,9 @@ mod test {
                 }
             };
 
-            if let Err(err) = pipeline.process(input, &mut output) {
+            if let Err(err) = pipeline.run(input, &mut output)
+                && !matches!(err, PipelineError::Cancelled)
+            {
                 output_tx
                     .send(Err(PipelineError::Processing(format!(
                         "Pipeline error: {err}"
@@ -299,8 +300,7 @@ mod test {
 
         // Run the writer task with the receiver
         let writer_handle = tokio::task::spawn_blocking(move || {
-            let mut writer_task =
-                FlvWriter::new(output_dir, base_name, "flv".to_string(), None, None);
+            let mut writer_task = FlvWriter::new(output_dir, base_name, "flv".to_string(), None);
 
             writer_task.run(output_rx)?;
 

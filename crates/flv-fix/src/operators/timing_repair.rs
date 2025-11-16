@@ -61,19 +61,14 @@ use tracing::{debug, error, info, trace, warn};
 const TOLERANCE: u32 = 1;
 
 /// Defines the strategy for timestamp repair
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum RepairStrategy {
     /// Strict mode enforces exact frame intervals and corrects any deviation
     Strict,
 
     /// Relaxed mode only fixes severe timing issues, allowing minor variations
+    #[default]
     Relaxed,
-}
-
-impl Default for RepairStrategy {
-    fn default() -> Self {
-        Self::Relaxed
-    }
 }
 
 /// Configuration options for the TimingRepairOperator
@@ -140,6 +135,8 @@ struct TimingState {
 
     /// Number of tags processed
     tag_count: u32,
+    /// Whether the stream has video
+    has_video: bool,
 }
 
 impl TimingState {
@@ -161,6 +158,7 @@ impl TimingState {
             rebound_count: 0,
             discontinuity_count: 0,
             tag_count: 0,
+            has_video: false,
         }
     }
 
@@ -175,6 +173,7 @@ impl TimingState {
         self.audio_rate = config.default_audio_rate;
         self.audio_sample_interval =
             Self::calculate_audio_sample_interval(config.default_audio_rate);
+        self.has_video = false;
     }
 
     /// Calculate the video frame interval in milliseconds based on frame rate
@@ -294,7 +293,13 @@ impl TimingState {
         let base_threshold = match tag.tag_type {
             FlvTagType::Video => self.video_frame_interval,
             FlvTagType::Audio => self.audio_sample_interval,
-            _ => max(self.video_frame_interval, self.audio_sample_interval),
+            _ => {
+                if self.has_video {
+                    max(self.video_frame_interval, self.audio_sample_interval)
+                } else {
+                    self.audio_sample_interval
+                }
+            }
         };
 
         // Add tolerance to account for rounding errors
@@ -513,35 +518,43 @@ impl Processor<FlvData> for TimingRepairOperator {
     /// Process method that receives FLV data, corrects timing issues, and forwards the data
     fn process(
         &mut self,
-        mut input: FlvData,
+        context: &Arc<StreamerContext>,
+        input: FlvData,
         output: &mut dyn FnMut(FlvData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
-        match &mut input {
-            FlvData::Header(_) => {
+        if context.token.is_cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
+        match input {
+            FlvData::Header(header) => {
                 // Reset state when encountering a header
                 self.state.reset(&self.config);
+                self.state.has_video = header.has_video;
 
-                debug!("{} TimingRepair: Processing new segment", self.context.name);
+                debug!(
+                    "{} TimingRepair: Processing new segment, has_video: {}",
+                    self.context.name, self.state.has_video
+                );
 
                 // Forward the header unmodified
-                output(input)
+                output(FlvData::Header(header))
             }
-            FlvData::Tag(tag) => {
+            FlvData::Tag(mut tag) => {
                 self.state.tag_count += 1;
                 let original_timestamp = tag.timestamp_ms;
 
                 // Handle script tags (metadata)
                 if tag.is_script_tag() {
-                    return self.handle_script_tag(tag, output);
+                    return self.handle_script_tag(&mut tag, output);
                 }
 
                 // Check for timestamp issues
                 let mut need_correction = false;
 
                 // Check for timestamp rebounds
-                if self.state.is_timestamp_rebounded(tag) {
+                if self.state.is_timestamp_rebounded(&tag) {
                     self.state.rebound_count += 1;
-                    let new_delta = self.state.calculate_delta_correction(tag);
+                    let new_delta = self.state.calculate_delta_correction(&tag);
 
                     warn!(
                         "{} TimingRepair: Timestamp rebound detected: {}ms, last ts: {}ms,  would go back in time - applying correction delta: {}ms",
@@ -555,9 +568,9 @@ impl Processor<FlvData> for TimingRepairOperator {
                     need_correction = true;
                 }
                 // Check for discontinuities
-                else if self.state.is_timestamp_discontinuous(tag, &self.config) {
+                else if self.state.is_timestamp_discontinuous(&tag, &self.config) {
                     self.state.discontinuity_count += 1;
-                    let new_delta = self.state.calculate_delta_correction(tag);
+                    let new_delta = self.state.calculate_delta_correction(&tag);
 
                     warn!(
                         "{} TimingRepair: Timestamp discontinuity detected: {}ms, last ts: {}ms, applying correction delta: {}ms",
@@ -610,21 +623,21 @@ impl Processor<FlvData> for TimingRepairOperator {
                 }
 
                 // Update state with this tag
-                self.state.update_last_tags(tag);
+                self.state.update_last_tags(&tag);
 
                 // Forward the tag with corrected timestamp
-                output(input)
+                output(FlvData::Tag(tag))
             }
             // Forward other data types unmodified
-            _ => output(input),
+            other => output(other),
         }
     }
 
     fn finish(
         &mut self,
-        output: &mut dyn FnMut(FlvData) -> Result<(), PipelineError>,
+        _context: &Arc<StreamerContext>,
+        _output: &mut dyn FnMut(FlvData) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
-        let _ = output;
         // Finalize processing and log statistics
         info!(
             "{} TimingRepair complete: Processed {} tags, applied {} corrections, detected {} rebounds and {} discontinuities",
@@ -644,7 +657,7 @@ impl Processor<FlvData> for TimingRepairOperator {
 
 #[cfg(test)]
 mod tests {
-    use pipeline_common::StreamerContext;
+    use pipeline_common::{CancellationToken, StreamerContext};
 
     use super::*;
     use crate::test_utils::{
@@ -656,8 +669,8 @@ mod tests {
         config: TimingRepairConfig,
         input_tags: Vec<FlvData>,
     ) -> Vec<FlvData> {
-        let context = StreamerContext::arc_new();
-        let mut operator = TimingRepairOperator::new(context, config);
+        let context = StreamerContext::arc_new(CancellationToken::new());
+        let mut operator = TimingRepairOperator::new(context.clone(), config);
 
         // Collect results in a vector
         let mut results = Vec::new();
@@ -670,7 +683,7 @@ mod tests {
             };
 
             // Process the tag
-            operator.process(tag, &mut output_fn).unwrap();
+            operator.process(&context, tag, &mut output_fn).unwrap();
         }
 
         // Finish processing
@@ -678,7 +691,7 @@ mod tests {
             results.push(item);
             Ok(())
         };
-        operator.finish(&mut finish_output).unwrap();
+        operator.finish(&context, &mut finish_output).unwrap();
 
         results
     }
