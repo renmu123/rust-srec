@@ -4,9 +4,10 @@ use crossterm::{
 };
 use is_terminal::IsTerminal;
 use pipeline_common::CancellationToken;
-use std::io;
+use std::io::{self, BufRead};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
 
 /// Asynchronously listens for user input to trigger cancellation.
@@ -79,42 +80,47 @@ async fn handle_terminal_input(token: CancellationToken) {
 
 /// Handle input from stdin (piped input)
 async fn handle_stdin_input(token: CancellationToken) {
-    // Use tokio's async stdin
-    let stdin = tokio::io::stdin();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let (tx, rx) = mpsc::channel();
     
-    loop {
-        tokio::select! {
-            // Check for cancellation first (biased to prioritize cancellation)
-            biased;
-            
-            _ = token.cancelled() => {
-                info!("Stdin handler cancelled");
-                break;
-            }
-            
-            // Try to read the next line
-            result = lines.next_line() => {
-                match result {
-                    Ok(Some(line)) => {
-                        let trimmed = line.trim();
-                        if trimmed == "q" {
-                            println!("Cancellation requested. Shutting down gracefully...");
-                            token.cancel();
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        // EOF reached
-                        info!("Stdin EOF reached");
-                        break;
-                    }
-                    Err(e) => {
-                        info!("Error reading from stdin: {}", e);
+    // Spawn a blocking thread to read from stdin
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let reader = stdin.lock();
+        
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
                         break;
                     }
                 }
+                Err(_) => break,
+            }
+        }
+    });
+    
+    loop {
+        // Check for cancellation signal first.
+        if token.is_cancelled() {
+            break;
+        }
+        
+        // Try to receive a line from stdin with timeout
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if line.trim() == "q" {
+                    println!("Cancellation requested. Shutting down gracefully...");
+                    token.cancel();
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Continue waiting
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Stdin closed
+                break;
             }
         }
     }
