@@ -4,8 +4,9 @@ use crossterm::{
 };
 use is_terminal::IsTerminal;
 use pipeline_common::CancellationToken;
-use std::io::{self, BufRead};
+use std::io;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
 
 /// Asynchronously listens for user input to trigger cancellation.
@@ -78,59 +79,42 @@ async fn handle_terminal_input(token: CancellationToken) {
 
 /// Handle input from stdin (piped input)
 async fn handle_stdin_input(token: CancellationToken) {
-    // Spawn a blocking task to read from stdin
-    let handle = tokio::task::spawn_blocking(move || {
-        let stdin = io::stdin();
-        
-        // Use a scope to ensure the lock is released properly
-        loop {
-            if token.is_cancelled() {
+    // Use tokio's async stdin
+    let stdin = tokio::io::stdin();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
+    
+    loop {
+        tokio::select! {
+            // Check for cancellation first (biased to prioritize cancellation)
+            biased;
+            
+            _ = token.cancelled() => {
+                info!("Stdin handler cancelled");
                 break;
             }
             
-            // Lock stdin for each read attempt to allow periodic cancellation checks
-            let reader = stdin.lock();
-            let mut lines = reader.lines();
-            
-            match lines.next() {
-                Some(Ok(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed == "q" {
-                        println!("Cancellation requested. Shutting down gracefully...");
-                        token.cancel();
+            // Try to read the next line
+            result = lines.next_line() => {
+                match result {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed == "q" {
+                            println!("Cancellation requested. Shutting down gracefully...");
+                            token.cancel();
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // EOF reached
+                        info!("Stdin EOF reached");
+                        break;
+                    }
+                    Err(e) => {
+                        info!("Error reading from stdin: {}", e);
                         break;
                     }
                 }
-                Some(Err(e)) => {
-                    info!("Error reading from stdin: {}", e);
-                    break;
-                }
-                None => {
-                    // EOF reached
-                    info!("EOF reached on stdin");
-                    break;
-                }
-            }
-            // Lock is automatically dropped here, allowing other operations
-        }
-    });
-    
-    // Add a timeout to prevent indefinite waiting
-    let timeout_duration = Duration::from_millis(100);
-    loop {
-        if token.is_cancelled() {
-            handle.abort();
-            break;
-        }
-        
-        match tokio::time::timeout(timeout_duration, &mut handle).await {
-            Ok(_) => {
-                // Task completed normally
-                break;
-            }
-            Err(_) => {
-                // Timeout occurred, check cancellation and continue
-                continue;
             }
         }
     }
