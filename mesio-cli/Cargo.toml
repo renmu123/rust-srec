@@ -8,7 +8,7 @@ repository = "https://github.com/hua0512/rust-srec"
 
 [dependencies]
 bytes = "1.11.0"
-tokio = { version = "1.48.0", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "sync"] }
+tokio = { version = "1.48.0", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync"] }
 tokio-util = { version = "0.7.11" }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = [
