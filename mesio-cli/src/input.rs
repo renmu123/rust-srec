@@ -4,8 +4,9 @@ use crossterm::{
 };
 use is_terminal::IsTerminal;
 use pipeline_common::CancellationToken;
-use std::io::{self, BufRead};
+use std::io;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tracing::info;
 
 /// Asynchronously listens for user input to trigger cancellation.
@@ -78,30 +79,41 @@ async fn handle_terminal_input(token: CancellationToken) {
 
 /// Handle input from stdin (piped input)
 async fn handle_stdin_input(token: CancellationToken) {
-    // Spawn a blocking task to read from stdin
-    tokio::task::spawn_blocking(move || {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
-        
-        for line in reader.lines() {
-            if token.is_cancelled() {
+    use tokio::io::BufReader;
+    
+    // Wrap stdin in an async reader
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+    
+    loop {
+        tokio::select! {
+            // Check for cancellation
+            _ = token.cancelled() => {
+                info!("Stdin handler cancelled");
                 break;
             }
-            
-            match line {
-                Ok(line) => {
-                    let trimmed = line.trim();
-                    if trimmed == "q" {
-                        println!("Cancellation requested. Shutting down gracefully...");
-                        token.cancel();
+            // Read next line
+            line_result = reader.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed == "q" {
+                            println!("Cancellation requested. Shutting down gracefully...");
+                            token.cancel();
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // EOF reached
+                        info!("Stdin closed");
+                        break;
+                    }
+                    Err(e) => {
+                        info!("Error reading from stdin: {}", e);
                         break;
                     }
                 }
-                Err(e) => {
-                    info!("Error reading from stdin: {}", e);
-                    break;
-                }
             }
         }
-    }).await.ok();
+    }
 }
